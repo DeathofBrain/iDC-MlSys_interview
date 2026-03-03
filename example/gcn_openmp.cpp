@@ -9,13 +9,31 @@
 #include <iomanip>
 #include <chrono>
 
+#include <immintrin.h>  // AVX/SSE
+
 using namespace std;
+
+struct CSRMatrix {
+    int n_rows, n_cols, nnz;
+    vector<int> row_ptr;
+    vector<int> col_idx;
+    vector<float> values;
+    
+	CSRMatrix() = default;
+
+    CSRMatrix(int rows, int cols) : n_rows(rows), n_cols(cols), nnz(0) {
+        row_ptr.resize(rows + 1, 0);
+    }
+};
+
 
 typedef std::chrono::time_point<std::chrono::steady_clock> TimePoint;
 
 int v_num = 0;
 int e_num = 0;
 int F0 = 0, F1 = 0, F2 = 0;
+
+CSRMatrix graph;
 
 vector<vector<int>> edge_index;
 vector<vector<float>> edge_val;
@@ -64,17 +82,94 @@ void raw_graph_to_AdjacencyList()
 	}
 }
 
+void raw_graph_to_CSR()
+{
+	// count dst edges (each vertex has at least one self-loop)
+	vector<int> row_sizes(v_num, 0);
+	
+	for (int i = 0; i < raw_graph.size() / 2; i++)
+	{
+		int src = raw_graph[2*i];
+		int dst = raw_graph[2*i + 1];
+		row_sizes[dst]++;
+	}
+
+	// construct row_ptr
+	graph.row_ptr.resize(v_num + 1, 0);
+	for (int i = 0; i < v_num; i++)
+	{
+		graph.row_ptr[i + 1] = graph.row_ptr[i] + row_sizes[i];
+	}
+
+	// allocate col_idx and values
+	graph.col_idx.resize(graph.row_ptr[v_num], 0);
+	graph.values.resize(graph.row_ptr[v_num], 1.0f);
+
+	// fill col_idx and values
+	vector<int> current_pos(v_num, 0);
+	
+
+	// add edges from raw_graph
+	for (int i = 0; i < raw_graph.size() / 2; i++)
+	{
+		int src = raw_graph[2*i];
+		int dst = raw_graph[2*i + 1];
+		int pos = graph.row_ptr[dst] + current_pos[dst];
+		graph.col_idx[pos] = src;
+		current_pos[dst]++;
+	}
+}
+
 void edgeNormalization()
 {
 	for (int i = 0; i < v_num; i++)
 	{
 		for (int j = 0; j < edge_index[i].size(); j++)
 		{
-			float val = 1.0f / sqrt(degree[i]) / sqrt(degree[edge_index[i][j]]);
+			float val = 1 / sqrt(degree[i]) / sqrt(degree[edge_index[i][j]]);
 			edge_val[i].push_back(val);
 		}
 	}
 }
+
+void edgeNormalizationCSR()
+{
+    // calculate degree for each vertex
+    vector<float> degree(v_num, 0.0f);
+    
+    for (int i = 0; i < v_num; i++)
+    {
+        for (int j = graph.row_ptr[i]; j < graph.row_ptr[i + 1]; j++)
+        {
+            degree[i] += graph.values[j];
+        }
+    }
+    
+    // normalize edge values using the degree of source and destination vertices
+    for (int i = 0; i < v_num; i++)
+    {
+        // calculate the normalization factor for vertex i
+        float norm_i = 0.0f;
+        if (degree[i] > 0.0f) {
+            norm_i = 1.0f / sqrtf(degree[i]);
+        }
+        
+        for (int j = graph.row_ptr[i]; j < graph.row_ptr[i + 1]; j++)
+        {
+            int nbr = graph.col_idx[j];
+            
+            // calculate the normalization factor for the neighbor vertex
+            float norm_nbr = 0.0f;
+            if (degree[nbr] > 0.0f) {
+                norm_nbr = 1.0f / sqrtf(degree[nbr]);
+            }
+            
+            // apply normalization to the edge value
+            graph.values[j] *= norm_i * norm_nbr;
+        }
+    }
+}
+
 
 void readFloat(char *fname, float *&dst, int num)
 {
@@ -95,23 +190,54 @@ void XW(int in_dim, int out_dim, float *in_X, float *out_X, float *W)
 	float(*tmp_in_X)[in_dim] = (float(*)[in_dim])in_X;
 	float(*tmp_out_X)[out_dim] = (float(*)[out_dim])out_X;
 	float(*tmp_W)[out_dim] = (float(*)[out_dim])W;
-	// #pragma omp parallel for
+
+	#pragma omp parallel for
 	for (int i = 0; i < v_num; i++)
 	{
-		for (int j = 0; j < out_dim; j++)
+		for (int k = 0; k < in_dim; k++)
 		{
-			for (int k = 0; k < in_dim; k++)
-			{
-				tmp_out_X[i][j] += tmp_in_X[i][k] * tmp_W[k][j];
-			}
+			float a_ik = tmp_in_X[i][k];
+            
+            // SIMD
+            #ifdef __AVX2__
+            // get the pointer to the k-th row of W and the i-th row of out_X
+            float* w_row = tmp_W[k];
+            float* out_row = tmp_out_X[i];
+            
+            __m256 a_vec = _mm256_set1_ps(a_ik);
+            int j = 0;
+            for (; j + 7 < out_dim; j += 8) {
+                // load 8 floats from W and out_X
+                __m256 w_vec = _mm256_loadu_ps(&w_row[j]);
+                __m256 out_vec = _mm256_loadu_ps(&out_row[j]);
+                
+                // out_vec = out_vec + a_vec * w_vec
+                out_vec = _mm256_fmadd_ps(a_vec, w_vec, out_vec);
+                
+                // store the result back to out_X
+                _mm256_storeu_ps(&out_row[j], out_vec);
+            }
+            
+            // deal with the remaining elements
+            for (; j < out_dim; j++) {
+                tmp_out_X[i][j] += a_ik * tmp_W[k][j];
+            }
+            #else
+            // original code without SIMD
+            for (int j = 0; j < out_dim; j++) {
+                tmp_out_X[i][j] += a_ik * tmp_W[k][j];
+            }
+            #endif
 		}
 	}
+	
 }
 
 void AX(int dim, float *in_X, float *out_X)
 {
 	float(*tmp_in_X)[dim] = (float(*)[dim])in_X;
 	float(*tmp_out_X)[dim] = (float(*)[dim])out_X;
+
 
 	for (int i = 0; i < v_num; i++)
 	{
@@ -122,6 +248,26 @@ void AX(int dim, float *in_X, float *out_X)
 			for (int k = 0; k < dim; k++)
 			{
 				tmp_out_X[i][k] += tmp_in_X[nbr][k] * edge_val[i][j];
+			}
+		}
+	}
+}
+
+void AX_CSR(int dim, float *in_X, float *out_X)
+{
+	float(*tmp_in_X)[dim] = (float(*)[dim])in_X;
+	float(*tmp_out_X)[dim] = (float(*)[dim])out_X;
+
+	#pragma omp parallel for
+	for (int i = 0; i < v_num; i++)
+	{
+		for (int j = graph.row_ptr[i]; j < graph.row_ptr[i + 1]; j++)
+		{
+			int nbr = graph.col_idx[j];
+			float edge_weight = graph.values[j];
+			for (int k = 0; k < dim; k++)
+			{
+				tmp_out_X[i][k] += tmp_in_X[nbr][k] * edge_weight;
 			}
 		}
 	}
@@ -193,12 +339,18 @@ void freeFloats()
 void somePreprocessing()
 {
 	//The graph  will be transformed into adjacency list ,you can use other data structure such as CSR
-	raw_graph_to_AdjacencyList();
+	// raw_graph_to_AdjacencyList();
+	raw_graph_to_CSR();
 }
 
 int main(int argc, char **argv)
 {
-	printf("GCN Example\n");
+	printf("GCN Example_openmp\n");
+	#ifdef __AVX2__
+	printf("Using AVX2 optimizations\n");
+	#else
+	printf("AVX2 not supported, using original code\n");
+	#endif
 	// Do NOT count the time of reading files, malloc, and memset
 	F0 = atoi(argv[1]);
 	F1 = atoi(argv[2]);
@@ -227,7 +379,8 @@ int main(int argc, char **argv)
 	printf("prepross_time: %.8lf\n", prepross_time);
 
 	TimePoint edgeNorm_start = chrono::steady_clock::now();
-	edgeNormalization();
+	// edgeNormalization();
+	edgeNormalizationCSR();
 	TimePoint edgeNorm_end = chrono::steady_clock::now();
 	chrono::duration<double> edgeNorm_ = edgeNorm_end - edgeNorm_start;
 	double edgeNorm_time = edgeNorm_.count() * 1e3;
@@ -246,7 +399,8 @@ int main(int argc, char **argv)
 
 	// printf("Layer1 AX\n");
 	TimePoint AX1_start = chrono::steady_clock::now();
-	AX(F1, X1_inter, X1);
+	// AX(F1, X1_inter, X1);
+	AX_CSR(F1, X1_inter, X1);
 	TimePoint AX1_end = chrono::steady_clock::now();
 	chrono::duration<double> AX1_ = AX1_end - AX1_start;
 	double AX1_time = AX1_.count() * 1e3;
@@ -270,7 +424,8 @@ int main(int argc, char **argv)
 
 	// printf("Layer2 AX\n");
 	TimePoint AX2_start = chrono::steady_clock::now();
-	AX(F2, X2_inter, X2);
+	// AX(F2, X2_inter, X2);
+	AX_CSR(F2, X2_inter, X2);
 	TimePoint AX2_end = chrono::steady_clock::now();
 	chrono::duration<double> AX2_ = AX2_end - AX2_start;
 	double AX2_time = AX2_.count() * 1e3;
